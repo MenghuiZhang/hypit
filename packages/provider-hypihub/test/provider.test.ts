@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { encodeOAuth2Credential } from "@hypit/runtime";
 
-import { EndpointRegistry, MemoryResourceStore } from "@hypit/driver-node";
-import { defineEndpointPackage } from "@hypit/endpoint-kit";
-import type { AsyncEndpoint } from "@hypit/endpoint-kit";
+import { EndpointRegistry, MemoryResourceStore } from "@hypit/executor";
+import { defineEndpoint } from "@hypit/endpoint";
+import type { AsyncEndpoint } from "@hypit/endpoint";
 import type { CanonicalValue, Need } from "@hypit/protocol";
 import { mimoSpeechEndpoints, sealMimoSpeechRequest } from "@hypit/mimo-speech";
 import { fishAudioSpeechEndpoints, sealFishAudioSpeechRequest } from "@hypit/fishaudio-speech";
@@ -12,12 +13,15 @@ import { elevenLabsSpeechEndpoints, sealElevenLabsSpeechRequest } from "@hypit/e
 import { generationTypes } from "@hypit/generation";
 import { gptImageEndpoints, sealGptImage2Request } from "@hypit/gpt-image";
 import { sealSeedanceRequest, seedanceEndpoints } from "@hypit/seedance";
-import { sealSpeechEvidenceAudio } from "@hypit/speech";
-import { speechEvidenceTypes } from "@hypit/speech-evidence";
+import { sealSpeechEvidenceAudio, speechEvidenceTypes } from "@hypit/speech-evidence";
 import { whisperXCapabilities, whisperXRequestForEvidenceAudio } from "@hypit/whisperx";
 import { portraitMattingEndpoint, sealPortraitMattingRequest } from "@hypit/volcengine-matting";
 
 import { createHypiHubProvider, diagnoseHypiHubProvider } from "../src/provider.js";
+
+const packageVersion = (JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { readonly version: string }).version;
 
 function need(constraints: CanonicalValue): Need {
   return {
@@ -239,6 +243,8 @@ test("HypiHub returns its current model-pricing document", async () => {
     fetch: async (input, init) => {
       assert.equal(String(input), "https://hypit.ai/v1/pricing?model=seedance-2");
       assert.equal((init?.headers as Record<string, string>).authorization, "Bearer test-key");
+      assert.equal((init?.headers as Record<string, string>)["user-agent"],
+        `hypit-provider-hypihub/${packageVersion}`);
       return Response.json({
         object: "model_pricing",
         model: "seedance-2",
@@ -364,9 +370,7 @@ test("HypiHub declares both MiMo speech capabilities; who serves them is the Pro
   assert.ok(needs.every((item) => registry.resolve(item).status === "resolved"));
 
   // A second Endpoint offering the same capability makes the choice the deployment's, not the Provider's.
-  const other = defineEndpointPackage({
-    module: { name: "example.tts", version: "1" },
-    facet: "tts",
+  const other = defineEndpoint({
     instance: "mimo.official",
     pool: "mimo.official",
     capabilities: [{
@@ -604,7 +608,7 @@ test("HypiHub stops before paid submission when a reference upload fails", async
   const reference = await resources.put(new Uint8Array([1, 2, 3]), "image/png");
   const request = need(sealSeedanceRequest("seedance-2-mini", {
     prompt: ["A presenter turns toward camera."],
-    referenceImage: [{ role: "image", artifact: reference }],
+    referenceImage: [{ role: "image", artifact: reference, fields: { personReference: true } }],
     resolution: ["720p"], aspectRatio: ["16:9"], duration: [5],
     generateAudio: [false], webSearch: [false],
   }) as unknown as CanonicalValue);
@@ -674,11 +678,11 @@ test("HypiHub stops before paid submission when a reference upload fails", async
   assert.equal(uploadAttempts, 2);
   assert.equal(cancelled, true);
   assert.equal(paidSubmissions, 0);
-  assert.match(outcome.status === "failed" ? outcome.failure.message : "", /request preparation failed.*generation not submitted/u);
+  assert.match(outcome.status === "failed" ? outcome.failure.message : "", /reference upload failed before generation submission/u);
   assert.doesNotMatch(outcome.status === "failed" ? outcome.failure.message : "", /must-not-leak/u);
 });
 
-test("HypiHub fulfills the Provider-neutral WhisperX alignment capability", async () => {
+for (const language of ["en", "ko"]) test(`HypiHub forwards ${language} for the Provider-neutral WhisperX alignment capability`, async () => {
   const resources = new MemoryResourceStore();
   const bytes = wav(32_000);
   const artifact = await resources.put(bytes, "audio/wav");
@@ -687,9 +691,10 @@ test("HypiHub fulfills the Provider-neutral WhisperX alignment capability", asyn
     capability: whisperXCapabilities.alignment,
     returns: speechEvidenceTypes.alignedTranscript,
     constraints: whisperXRequestForEvidenceAudio(sealSpeechEvidenceAudio({
+      domainId: "hypihub-test-domain",
       artifact,
       sampleFrames: 32_000,
-    }), { language: "en" }) as unknown as CanonicalValue,
+    }), { language }) as unknown as CanonicalValue,
     result: "record:hypihub-whisperx",
   };
   let submitted = false;
@@ -732,12 +737,12 @@ test("HypiHub fulfills the Provider-neutral WhisperX alignment capability", asyn
       submitted = true;
       const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
       assert.equal(body.model, "victor-upmeet/whisperx");
-      assert.equal(body.language, "en");
+      assert.equal(body.language, language);
       assert.equal(body.response_format, "verbose_json");
       assert.equal(body.url, "https://hypit.ai/files/alignment-evidence.wav");
       assert.deepEqual(body.timestamp_granularities, ["segment", "word"]);
       return Response.json({
-        language: "en",
+        language,
         words: [
           { word: "hello", start: 0.1, end: 0.4 },
           { word: "world", start: 1.2, end: 1.6 },
@@ -756,7 +761,10 @@ test("HypiHub fulfills the Provider-neutral WhisperX alignment capability", asyn
     credentials: { apiKey: { secret: "test-key" } },
   });
   assert.equal(submitted, true);
-  assert.deepEqual(result.value, { kind: "inline", value: { passages: [{
+  assert.deepEqual(result.value, { kind: "inline", value: {
+    domainId: "hypihub-test-domain",
+    sampleFrames: 32_000,
+    passages: [{
     startSample: 1_600,
     endSampleExclusive: 25_600,
     words: [
@@ -786,14 +794,16 @@ test("HypiHub exposes model groups beneath its own total capacity", async () => 
   assert.throws(() => createHypiHubProvider({ capabilityConcurrency: { invented: 1 } }), /unknown HypiHub capacity/);
 });
 
-test("HypiHub polling errors and operation deadlines fail without settlement polling", async () => {
+test("HypiHub operation deadlines fail while polling transport errors keep the job pending", async () => {
   const request = need({});
   let requests = 0;
+  let reply: (() => Response) | undefined;
   const registry = new EndpointRegistry();
   await createHypiHubProvider({ pollIntervalMs: 0, operationTimeoutMs: 60_000,
     fetch: async (url) => {
       requests++; assert.match(String(url), /\/jobs\/test$/);
-      throw new Error("offline");
+      if (reply === undefined) throw new Error("offline");
+      return reply();
     } }).install(registry);
   const selected = registry.resolve(request);
   assert.equal(selected.status, "resolved"); assert.equal(selected.registration.kind, "asynchronous");
@@ -806,21 +816,34 @@ test("HypiHub polling errors and operation deadlines fail without settlement pol
   assert.equal(timedOut.status, "failed");
   assert.equal(timedOut.status === "failed" && timedOut.failure.code, "HYPIHUB_OPERATION_TIMEOUT");
   assert.equal(requests, 0);
-  const offline = await endpoint.poll({ ...common, handle: { ...common.handle, startedAt: Date.now() } });
-  assert.equal(offline.status, "failed");
-  assert.match(offline.status === "failed" ? offline.failure.message : "", /offline/);
+  const live = { ...common, handle: { ...common.handle, startedAt: Date.now() } };
+  const offline = await endpoint.poll(live);
+  assert.equal(offline.status, "pending");
+  assert.equal(offline.status === "pending" && offline.progress?.phase, "retrying");
   assert.equal(requests, 1);
+  reply = () => new Response("", { status: 429, headers: { "retry-after": "3" } });
+  const before = Date.now();
+  const limited = await endpoint.poll(live);
+  assert.equal(limited.status, "pending");
+  assert.ok(limited.status === "pending" && limited.wakeAt! >= before + 3_000);
+  reply = () => new Response("{}", { status: 404 });
+  const missing = await endpoint.poll(live);
+  assert.equal(missing.status, "failed");
+  assert.equal(requests, 3);
+  const unconfigured = await endpoint.poll({ ...live, credentials: {} });
+  assert.equal(unconfigured.status, "failed");
+  assert.equal(requests, 3);
 });
 
 test("reference URL reuse includes its authored classification and forwards it to custom transport", async () => {
   const resources = new MemoryResourceStore();
   const reference = await resources.put(new Uint8Array([1, 2, 3]), "image/png");
-  const flags = [true, false, undefined, true];
+  const flags = [true, false, true];
   const request = need(sealSeedanceRequest("seedance-2-mini", {
     prompt: ["A person waves."], resolution: ["720p"], aspectRatio: ["9:16"],
     duration: [5], generateAudio: [false], webSearch: [false],
     referenceImage: flags.map((flag) => ({ role: "image", artifact: reference,
-      ...(flag === undefined ? {} : { fields: { personReference: flag } }) })),
+      fields: { personReference: flag } })),
   }) as unknown as CanonicalValue);
   const seen: unknown[] = [];
   const provider = createHypiHubProvider({
@@ -842,7 +865,7 @@ test("reference URL reuse includes its authored classification and forwards it t
   const started = await resolved.registration.endpoint.start({ command: { kind: "fulfill-need", id: "classified", need: request }, need: request, resources,
     credentials: { apiKey: { secret: "test-key" } }, operation: "classified" });
   assert.equal(started.status, "pending");
-  assert.deepEqual(seen, [{ personReference: true }, { personReference: false }, {}]);
+  assert.deepEqual(seen, [{ personReference: true }, { personReference: false }]);
 });
 
 test("generation and voice cloning check their exact catalogue operation before resolving references", async () => {
@@ -853,7 +876,7 @@ test("generation and voice cloning check their exact catalogue operation before 
     {
       endpoint: seedanceEndpoints.mini!, model: "seedance-2-mini", operation: "videos", path: "/videos",
       constraints: sealSeedanceRequest("seedance-2-mini", {
-        prompt: ["A presenter speaks."], referenceImage: [{ role: "image", artifact: image }],
+        prompt: ["A presenter speaks."], referenceImage: [{ role: "image", artifact: image, fields: { personReference: true } }],
         resolution: ["720p"], aspectRatio: ["9:16"], duration: [5], generateAudio: [true], webSearch: [false],
       }),
       references: true,
@@ -929,26 +952,22 @@ test("generation and voice cloning check their exact catalogue operation before 
       try { await selected.registration.handler(context); }
       catch (error) { failed = error as Error & { code?: string }; }
     }
-    if (availability === "available") {
+    if (availability === "available" || availability === "unknown") {
       assert.equal(failed, undefined);
       assert.deepEqual(events, item.references ? ["catalogue", "reference", "submit"] : ["catalogue", "submit"]);
       assert.match(progress.at(-1)!, /Submitting HypiHub request/u);
     } else {
       assert.ok(failed);
       assert.deepEqual(events, ["catalogue"], "neither a reference nor another model is tried");
-      assert.match(failed.message, /model catalogue check failed.*references uploaded=0; generation not submitted/u);
-      assert.ok(failed.message.includes(`model=${item.model}; operation=${item.operation}`));
       if (availability === "missing") {
         assert.equal(failed.code, "model_not_found");
         assert.match(failed.message, /HTTP 404.*request=catalogue-request.*No route for this account/u);
       } else if (availability === "different-operation") {
+        assert.equal(failed.code, "HYPIHUB_MODEL_OPERATION_UNAVAILABLE");
         assert.match(failed.message, /does not list operation.*listed operations: transcriptions/u);
       } else if (availability === "undeclared") {
         assert.match(failed.message, /returned no valid operation list.*is unknown/u);
         assert.doesNotMatch(failed.message, /does not list operation|model_not_found/u);
-      } else {
-        assert.match(failed.message, /Connection closed before catalogue response/u);
-        assert.doesNotMatch(failed.message, /model_not_found/u);
       }
       assert.equal(progress.length, 1);
       assert.match(progress[0]!, /Reading HypiHub model catalogue/u);
@@ -1079,7 +1098,7 @@ for (const mode of ['success', 'error', 'body-timeout'] as const) {
     const request: Need = {
       id: 'need:transcription-receipt', capability: whisperXCapabilities.alignment,
       returns: speechEvidenceTypes.alignedTranscript,
-      constraints: whisperXRequestForEvidenceAudio(sealSpeechEvidenceAudio({ artifact, sampleFrames: 32_000 }), { language: 'en' }) as unknown as CanonicalValue,
+      constraints: whisperXRequestForEvidenceAudio(sealSpeechEvidenceAudio({ domainId: "receipt-test-domain", artifact, sampleFrames: 32_000 }), { language: 'en' }) as unknown as CanonicalValue,
       result: 'record:transcription-receipt',
     };
     const messages: string[] = [];

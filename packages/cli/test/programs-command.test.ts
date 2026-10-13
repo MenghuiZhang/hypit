@@ -1,13 +1,33 @@
 import assert from "node:assert/strict";
+import { realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import test from "node:test";
 
-import { runCli } from "../src/main.js";
+import { runCliApplication } from "../src/application.js";
 import { commandHint } from "../src/command-hint.js";
 import type { CliDistribution } from "../src/distribution.js";
-import type { CliManagedProgramProgress, CliManagedProgramReport, CliRuntimeController } from "../src/runtime-port.js";
+import type { CliIo } from "../src/output.js";
+import { cliCommandModules } from "../../runtime-local/src/cli.js";
+import type { ManagedProgramProgress as CliManagedProgramProgress, ManagedProgramReport as CliManagedProgramReport } from "../../runtime-local/src/programs.js";
+import type { RuntimeController as CliRuntimeController } from "../../runtime-local/src/host-api.js";
 
 const io = { write: () => {} };
+const applicationCwd = tmpdir();
+const runCli = async (argv: readonly string[], output: CliIo, selected: CliDistribution) =>
+  await runCliApplication(argv, output, {
+    // This suite mounts the Local Runtime command contribution onto deliberately
+    // small Distribution doubles. Assemble its product-specific Host port just
+    // as the real video executable does; the generic CLI port remains separate.
+    distribution: {
+      ...selected,
+      openLocalRuntimeHost: async (path: string, options: Parameters<CliDistribution["openRuntimeHost"]>[1]) =>
+        await selected.openRuntimeHost(path, options),
+    } as CliDistribution,
+    commandModules: cliCommandModules,
+    cwd: applicationCwd,
+    resolveProjectRoot: async (explicit) => await realpath(explicit ?? tmpdir()),
+  });
 
 function controller(
   path: string,
@@ -25,6 +45,7 @@ function controller(
       down: async () => worker,
     },
     programs: {
+      prepare: async (options) => { calls.push(`prepare ${path} ${JSON.stringify(options)}`); return { dataRoot: "/tmp", programs: reports }; },
       up: async (options) => {
         calls.push(`up ${path} ${JSON.stringify(options)}`);
         return { dataRoot: "/tmp", programs: reports };
@@ -40,7 +61,6 @@ function distribution(calls: string[], reports: readonly CliManagedProgramReport
     bootstrapPackages: [],
     openRuntimeHost: async (path: string) => ({
       profile: path,
-      prepare: async () => [],
       createRuntime: async () => ({ close: async () => {} }),
       controller: async () => controller(path, calls, reports),
     }),
@@ -54,7 +74,7 @@ test("programs dispatches lifecycle through the selected Runtime Controller", as
   await runCli(["programs", "status", "/p/hypit.runtime.json"], io, distribution(calls));
   // The CLI resolves the profile it is given, and what resolving produces is the platform's own
   // spelling. Asserting the argument back verbatim would only be asserting that this is POSIX.
-  const profile = resolve("/p/hypit.runtime.json");
+  const profile = resolve(applicationCwd, "/p/hypit.runtime.json");
   assert.deepEqual(calls, [
     `up ${profile} {"maxWaitMs":1000}`,
     `down ${profile}`,
@@ -62,26 +82,28 @@ test("programs dispatches lifecycle through the selected Runtime Controller", as
   ]);
 });
 
-test("programs accepts only up, down and status", async () => {
+test("programs without a Runtime Profile explains how to select one", async () => {
+  const projectRoot = await realpath(tmpdir());
   await assert.rejects(
-    runCli(["programs", "restart", "/p/hypit.runtime.json"], io, distribution([])),
-    /programs takes up, down or status/u,
+    runCli(["programs", "status", "--project", projectRoot], io, distribution([])),
+    /programs requires a Runtime; run hypit runtime init, select one with runtime use, or pass --runtime <profile>/u,
   );
 });
 
-test("scoped preparation and startup receive the same explicit Endpoint set", async () => {
+test("programs accepts prepare, up, down and status", async () => {
+  await assert.rejects(
+    runCli(["programs", "restart", "/p/hypit.runtime.json"], io, distribution([])),
+    /programs takes prepare, up, down or status/u,
+  );
+});
+
+test("scoped Program startup receives the explicit Endpoint set", async () => {
   const calls: string[] = [];
-  let prepared: unknown;
-  const selected = distribution(calls);
-  const base = selected.openRuntimeHost!;
-  await runCli(["programs", "up", "/p/hypit.runtime.json", "--endpoint", "chosen", "--endpoint", "media"], io, {
-    ...selected,
-    openRuntimeHost: async (...args) => {
-      const host = await base(...args);
-      return { ...host, prepare: async (scope) => { prepared = scope?.endpoints; return []; } };
-    },
-  });
-  assert.deepEqual(prepared, ["chosen", "media"]);
+  await runCli(
+    ["programs", "up", "/p/hypit.runtime.json", "--endpoint", "chosen", "--endpoint", "media"],
+    io,
+    distribution(calls),
+  );
   assert.match(calls[0]!, /"endpoints":\["chosen","media"\]/u);
 });
 
@@ -167,6 +189,29 @@ test("a declined stop stays visible even when the service is not Ready", async (
   assert.equal(stopped.ready, false, "a successful stop is not service readiness");
 });
 
+test("programs down accepts a ready probe-only Program with nothing to stop", async () => {
+  const reports: CliManagedProgramReport[] = [{
+    id: "toolchain", endpoint: "media.local", action: "nothing-to-stop", state: { state: "ready" },
+  }];
+  let human = "";
+  await runCli(["programs", "down", "/p/profile.json"], {
+    write(text) { human += text; },
+  }, distribution([], reports));
+  assert.match(human, /No external programs to stop/u);
+
+  let output = "";
+  let exitCode: number | undefined;
+  await runCli(["programs", "down", "/p/profile.json", "--json"], {
+    write(text) { output += text; }, setExitCode(code) { exitCode = code; },
+  }, distribution([], reports));
+  const stopped = JSON.parse(output);
+  assert.equal(exitCode, undefined);
+  assert.equal(stopped.ok, true);
+  assert.equal(stopped.ready, true);
+  assert.equal(stopped.programCount, 1);
+  assert.equal(stopped.readyCount, 1);
+});
+
 test("Runtime headlines preserve a running Worker when Programs are down or stop fails", async () => {
   const selected = {
     bootstrapPackages: [],
@@ -199,7 +244,6 @@ test("program startup reports actions, not no-op checks", async () => {
     bootstrapPackages: [],
     openRuntimeHost: async (path: string) => ({
       profile: path,
-      prepare: async () => [],
       controller: async () => ({
         worker: {},
         programs: {
@@ -275,7 +319,6 @@ test("JSON startup keeps live preparation evidence on stderr and one result on s
   const selected = {
     bootstrapPackages: [],
     openRuntimeHost: async () => ({
-      prepare: async () => [],
       controller: async () => ({
         programs: {
           async up(options: { onProgress?: (event: CliManagedProgramProgress) => void }) {
@@ -302,7 +345,6 @@ test("runtime up validates the Runtime before it starts Programs", async () => {
     ...base,
     openRuntimeHost: async (path: string) => ({
       profile: path,
-      prepare: async () => [],
       controller: async () => controller(path, calls),
       createRuntime: async () => { throw new Error("Runtime Profile conflict"); },
     }),
@@ -344,11 +386,20 @@ test("runtime status keeps scheduling phases out of the default view", async () 
 });
 
 test("Worker stop suggests Program control in the same project and Profile", async () => {
-  const projectRoot = resolve("/tmp");
+  const projectRoot = await realpath(tmpdir());
   const runtimeProfile = resolve("/tmp/a selected profile.json");
   let output = "";
-  await runCli(["runtime", "down", "--workspace", projectRoot, "--runtime", runtimeProfile], {
+  await runCli(["runtime", "down", "--project", projectRoot, "--runtime", runtimeProfile], {
     write(text) { output += text; },
   }, distribution([]));
   assert.ok(output.includes(commandHint(["programs", "down"], { projectRoot, runtimeProfile })));
+  assert.match(output, /Managed Programs are unchanged/u);
+  assert.doesNotMatch(output, /were left running/u);
+});
+
+
+test("programs prepare provisions resources through the controller without starting a worker", async () => {
+  const calls: string[] = [];
+  await runCli(["programs", "prepare", "/p/hypit.runtime.json", "--endpoint", "speech"], io, distribution(calls));
+  assert.deepEqual(calls, [`prepare ${resolve(applicationCwd, "/p/hypit.runtime.json")} {"endpoints":["speech"]}`]);
 });

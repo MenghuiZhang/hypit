@@ -5,12 +5,13 @@ import { join } from "node:path";
 import test from "node:test";
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { createRuntimeEndpointAdapterFacet, RuntimeAdapterRegistry } from "@hypit/runtime-kit";
-import type { ManagedProgram, ManagedProgramCommand } from "@hypit/runtime-kit";
+import { createRuntimeEndpointAdapterFacet, RuntimeAdapterRegistry } from "@hypit/runtime-local/extension";
+import type { ManagedProgram, ManagedProgramCommand } from "@hypit/runtime-local/extension";
 import type { CapabilityRef } from "@hypit/protocol";
 
 import {
   bringManagedProgramsUp,
+  prepareManagedPrograms,
   declaredManagedPrograms,
   reportManagedPrograms,
   takeManagedProgramsDown,
@@ -132,7 +133,7 @@ test("Provider-owned preparation reconciles a cold installation and leaves a rea
   }));
   try {
     assert.equal((await bringManagedProgramsUp(configured.path, configured.options)).programs[0]?.action, "installed");
-    assert.equal((await bringManagedProgramsUp(configured.path, configured.options)).programs[0]?.action, "already-running");
+    assert.equal((await bringManagedProgramsUp(configured.path, configured.options)).programs[0]?.action, "unchanged");
     assert.equal(await readFile(join(configured.root, "prepared"), "utf8"), "prepared\n");
   } finally { await rm(configured.root, { recursive: true, force: true }); }
 });
@@ -216,6 +217,42 @@ test("down leaves a running program without a Hypit process record", async () =>
   const result = await takeManagedProgramsDown(path, options);
   assert.equal(result.programs[0]!.action, "not-ours");
   assert.match(result.programs[0]!.detail ?? "", /without a Hypit process record/u);
+});
+
+test("a ready probe-only Program is unchanged on up and has nothing to stop", async (t) => {
+  const { root, path, options } = await project(() => ({
+    id: "toolchain",
+    probe: async () => ({ state: "ready" }),
+  }));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const up = await bringManagedProgramsUp(path, options);
+  assert.equal(up.programs[0]!.action, "unchanged");
+  assert.equal(up.programs[0]!.pid, undefined);
+  const down = await takeManagedProgramsDown(path, options);
+  assert.equal(down.programs[0]!.action, "nothing-to-stop");
+  assert.deepEqual(down.programs[0]!.state, { state: "ready" });
+  assert.equal(down.programs[0]!.detail, undefined);
+  assert.equal(down.programs[0]!.pid, undefined);
+});
+
+test("up reports resources installed even when a probe-only tool was already usable", async (t) => {
+  const { root, path, options } = await project(root => ({
+    id: "toolchain",
+    probe: async () => ({ state: "ready" }),
+    installation: {
+      probe: async () => {
+        try { await readFile(join(root, "resource")); return { state: "ready" }; }
+        catch { return { state: "down", detail: "resource is not prepared" }; }
+      },
+      commands: [nodeProgram("require('node:fs').writeFileSync(process.argv[1], 'ready')", join(root, "resource"))],
+    },
+  }));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const up = await bringManagedProgramsUp(path, options);
+  assert.equal(up.programs[0]!.action, "installed");
+  assert.equal(up.programs[0]!.state.state, "ready");
+  assert.equal(up.programs[0]!.pid, undefined);
+  assert.ok(up.programs[0]!.installationLogPath);
 });
 
 test("a program with nothing to start is installed once, and installation is the whole job", async () => {
@@ -311,10 +348,11 @@ test("a failing install stops before starting anything, and says which command f
   assert.equal(result.programs[0]!.action, "unchanged");
   // Naming the command is half of what this test is for, so assert both halves rather than a
   // spelling of the interpreter that only holds on one platform.
-  const detail = result.programs[0]!.detail ?? "";
+  const state = result.programs[0]!.state;
+  const detail = state.state === "ready" ? "" : state.detail;
   assert.ok(detail.startsWith(`${process.execPath} failed:`), detail);
   assert.match(detail, /failed: no such project/u);
-  assert.match(await readFile(result.programs[0]!.logPath!, "utf8"), /no such project/u);
+  assert.match(await readFile(result.programs[0]!.installationLogPath!, "utf8"), /no such project/u);
 });
 
 test("ongoing preparation exposes its log and excludes another preparation", async () => {
@@ -440,4 +478,31 @@ test("status probes and changes nothing, so it claims no action", async () => {
   const result = await reportManagedPrograms(path, options);
   assert.equal(result.programs[0]!.action, undefined);
   assert.deepEqual(result.programs[0]!.state, { state: "down", detail: "nothing is answering" });
+});
+
+
+test("resource preparation runs for an online service and never starts or stops it", async (t) => {
+  let resources = false;
+  const configured = await project((root) => ({
+    id: "resources",
+    async probe() { return { state: "ready" }; },
+    installation: {
+      async probe() {
+        resources = await readFile(join(root, "prepared"), "utf8").then(() => true, () => false);
+        return resources ? { state: "ready" } : { state: "down", detail: "language resource absent" };
+      },
+      commands: [nodeProgram("require('node:fs').writeFileSync(process.argv[1], 'ready')", join(root, "prepared"))],
+    },
+    start: nodeProgram("throw new Error('prepare must not start a process')"),
+  }));
+  t.after(() => rm(configured.root, { recursive: true, force: true }));
+  const prepared = await prepareManagedPrograms(configured.path, configured.options);
+  assert.equal(prepared.programs[0]?.state.state, "ready");
+  assert.equal(prepared.programs[0]?.action, "installed");
+  assert.equal(prepared.programs[0]?.pid, undefined);
+  assert.equal(resources, true);
+  await rm(join(configured.root, "prepared"));
+  const up = await bringManagedProgramsUp(configured.path, configured.options);
+  assert.equal(up.programs[0]?.state.state, "ready");
+  assert.equal(resources, true, "up must not skip missing resources because a process is online");
 });
